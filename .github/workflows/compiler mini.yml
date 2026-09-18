@@ -1,0 +1,215 @@
+name: Sanne Android Builder
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+env:
+  APP_DIR: VA
+  DETAILS_FILE: VA/details.san
+  DEFAULT_APP_NAME: "SanneWebApp"
+  DEFAULT_PACKAGE_NAME: "com.sanne.webapp"
+  DEFAULT_LOGO: "https://picsum.photos/512"
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  android:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 17
+
+      - uses: android-actions/setup-android@v4
+
+      - name: Parse App Details
+        run: |
+          get_val() {
+            [ -f "$DETAILS_FILE" ] && grep "^$1=" "$DETAILS_FILE" | cut -d'=' -f2 | head -n1
+          }
+          APP_NAME=$(get_val appName)
+          PACKAGE_NAME=$(get_val packageName)
+          LOGO=$(get_val logo)
+          [ -z "$APP_NAME" ] && APP_NAME="$DEFAULT_APP_NAME"
+          [ -z "$PACKAGE_NAME" ] && PACKAGE_NAME="$DEFAULT_PACKAGE_NAME"
+          [ -z "$LOGO" ] && LOGO="$DEFAULT_LOGO"
+          echo "APP_NAME=$APP_NAME" >> $GITHUB_ENV
+          echo "PACKAGE_NAME=$PACKAGE_NAME" >> $GITHUB_ENV
+          echo "LOGO=$LOGO" >> $GITHUB_ENV
+          PACKAGE_PATH=$(echo $PACKAGE_NAME | tr '.' '/')
+          echo "PACKAGE_PATH=$PACKAGE_PATH" >> $GITHUB_ENV
+
+      - name: Copy App
+        run: |
+          mkdir build_app
+          rsync -av --exclude='details.san' $APP_DIR/ build_app/
+
+      - name: Prepare Logo
+        run: |
+          sudo apt-get update && sudo apt-get install -y ffmpeg imagemagick
+          mkdir -p android/app/src/main/res
+          if [[ "$LOGO" =~ ^https?:// ]]; then
+            curl -L "$LOGO" -o icon.tmp
+          elif [ -f "$APP_DIR/$LOGO" ]; then
+            cp "$APP_DIR/$LOGO" icon.tmp
+          else
+            curl -L "$DEFAULT_LOGO" -o icon.tmp
+          fi
+          ffmpeg -y -i icon.tmp icon.png || convert icon.tmp -background none -flatten icon.png
+          declare -A sizes=( ["mdpi"]=48 ["hdpi"]=72 ["xhdpi"]=96 ["xxhdpi"]=144 ["xxxhdpi"]=192 )
+          for density in "${!sizes[@]}"; do
+            mkdir -p android/app/src/main/res/mipmap-$density
+            convert icon.png -resize ${sizes[$density]}x${sizes[$density]} \
+              android/app/src/main/res/mipmap-$density/ic_launcher.png
+          done
+
+      - name: Create Android Project
+        run: |
+          mkdir -p android/app/src/main/java/$PACKAGE_PATH
+          mkdir -p android/app/src/main/assets
+          cp -r build_app/* android/app/src/main/assets/
+
+      - name: Create MainActivity
+        run: |
+          cat > android/app/src/main/java/$PACKAGE_PATH/MainActivity.java << EOF
+          package $PACKAGE_NAME;
+          import android.os.Bundle;
+          import android.webkit.WebView;
+          import android.webkit.WebViewClient;
+          import android.webkit.WebSettings;
+          import android.app.Activity;
+
+          public class MainActivity extends Activity {
+              WebView webView;
+              @Override
+              protected void onCreate(Bundle savedInstanceState) {
+                  super.onCreate(savedInstanceState);
+                  webView = new WebView(this);
+                  setContentView(webView);
+                  WebSettings s = webView.getSettings();
+                  s.setJavaScriptEnabled(true);
+                  s.setDomStorageEnabled(true);
+                  webView.setWebViewClient(new WebViewClient());
+                  webView.loadUrl("file:///android_asset/index.html");
+              }
+          }
+          EOF
+
+      - name: Android Config
+        run: |
+          mkdir -p android
+
+          cat > android/gradle.properties << EOF
+          android.useAndroidX=true
+          android.enableJetifier=true
+          EOF
+
+          cat > android/settings.gradle << EOF
+          rootProject.name = "$APP_NAME"
+          include ':app'
+          EOF
+
+          cat > android/build.gradle << 'EOF'
+          buildscript {
+            repositories { google(); mavenCentral() }
+            dependencies { classpath 'com.android.tools.build:gradle:8.4.0' }
+          }
+          allprojects {
+            repositories { google(); mavenCentral() }
+          }
+          EOF
+
+          cat > android/app/build.gradle << EOF
+          plugins {
+            id 'com.android.application'
+          }
+          android {
+            namespace "$PACKAGE_NAME"
+            compileSdk 35
+            signingConfigs {
+              release {
+                storeFile file("\$rootDir/keystore.jks")
+                storePassword "password"
+                keyAlias "sanne"
+                keyPassword "password"
+              }
+            }
+            defaultConfig {
+              applicationId "$PACKAGE_NAME"
+              minSdk 21
+              targetSdk 35
+              versionCode 1
+              versionName "1.0"
+            }
+            buildTypes {
+              release {
+                signingConfig signingConfigs.release
+                minifyEnabled false
+              }
+            }
+          }
+          dependencies {
+            implementation 'androidx.appcompat:appcompat:1.7.0'
+          }
+          configurations.all {
+              resolutionStrategy {
+                  force "org.jetbrains.kotlin:kotlin-stdlib:1.8.22"
+                  force "org.jetbrains.kotlin:kotlin-stdlib-jdk7:1.8.22"
+                  force "org.jetbrains.kotlin:kotlin-stdlib-jdk8:1.8.22"
+              }
+          }
+          EOF
+
+      - name: Manifest
+        run: |
+          cat > android/app/src/main/AndroidManifest.xml << EOF
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android"
+              package="$PACKAGE_NAME">
+
+            <!-- Internet access is a normal permission granted at install time -->
+            <uses-permission android:name="android.permission.INTERNET"/>
+            <!-- Optional: storage permissions (dangerous; require runtime request) -->
+            <uses-permission android:name="android.permission.READ_EXTERNAL_STORAGE"/>
+            <uses-permission android:name="android.permission.WRITE_EXTERNAL_STORAGE"/>
+
+            <application
+                android:label="$APP_NAME"
+                android:icon="@mipmap/ic_launcher">
+              <activity android:name=".MainActivity"
+                        android:exported="true">
+                <intent-filter>
+                  <action android:name="android.intent.action.MAIN"/>
+                  <category android:name="android.intent.category.LAUNCHER"/>
+                </intent-filter>
+              </activity>
+            </application>
+          </manifest>
+          EOF
+
+      - name: Generate Keystore
+        run: |
+          keytool -genkeypair \
+            -alias sanne -keyalg RSA -keysize 2048 \
+            -validity 10000 -dname "CN=$APP_NAME" \
+            -storepass password -keypass password \
+            -keystore android/keystore.jks
+
+      - name: Build Release APK
+        run: |
+          cd android
+          gradle wrapper --gradle-version 8.6
+          chmod +x ./gradlew
+          ./gradlew assembleRelease
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: android-apk
+          path: android/app/build/outputs/apk/release/*.apk
